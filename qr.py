@@ -1,6 +1,6 @@
 import os
 import uuid
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from urllib.parse import quote
 
@@ -10,8 +10,19 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-PAYEE_VPA = os.environ["PAYEE_VPA"]
-PAYEE_NAME = os.environ["PAYEE_NAME"]
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable {name}. "
+            "Copy .env.example to .env and fill in your own values."
+        )
+    return value
+
+
+PAYEE_VPA = _require_env("PAYEE_VPA")
+PAYEE_NAME = _require_env("PAYEE_NAME")
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:5000")
 
@@ -20,10 +31,38 @@ db_client = MongoClient(MONGO_URI)
 db = db_client["payments"]
 links_collection = db["links"]
 
+try:
+    links_collection.create_index("payment_id", unique=True)
+except Exception as exc:
+    print(f"Warning: could not ensure payment_id index: {exc}")
+
 # UPI QR codes above this amount need extra verification on many apps, so any
 # payment over this gets split across several QR codes, none exceeding it.
 MAX_QR_AMOUNT = Decimal("1999")
 SPLIT_THRESHOLD = Decimal("2000")
+
+# Sanity ceiling on a single request. Without this, a huge input (accidental
+# or malicious) would try to create tens of thousands of QR codes and
+# database writes in one go.
+MAX_TOTAL_AMOUNT = Decimal("200000")
+
+
+class AmountError(ValueError):
+    """Raised when a user supplied payment amount is not usable."""
+
+
+def parse_amount(raw) -> Decimal:
+    """Parse and validate a user supplied amount. Raises AmountError on bad input."""
+    try:
+        value = Decimal(str(raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError, TypeError):
+        raise AmountError("Enter a valid amount, like 25 or 199.50.")
+
+    if value <= 0:
+        raise AmountError("Amount must be greater than zero.")
+    if value > MAX_TOTAL_AMOUNT:
+        raise AmountError(f"Amount must be {MAX_TOTAL_AMOUNT:,.0f} rupees or less.")
+    return value
 
 
 def _to_amount(value) -> Decimal:
