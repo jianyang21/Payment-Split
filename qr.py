@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from urllib.parse import quote
@@ -7,6 +8,7 @@ from urllib.parse import quote
 import qrcode
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from pymongo.errors import OperationFailure, PyMongoError
 
 load_dotenv()
 
@@ -31,11 +33,6 @@ db_client = MongoClient(MONGO_URI)
 db = db_client["payments"]
 links_collection = db["links"]
 
-try:
-    links_collection.create_index("payment_id", unique=True)
-except Exception as exc:
-    print(f"Warning: could not ensure payment_id index: {exc}")
-
 # UPI QR codes above this amount need extra verification on many apps, so any
 # payment over this gets split across several QR codes, none exceeding it.
 MAX_QR_AMOUNT = Decimal("1999")
@@ -45,6 +42,31 @@ SPLIT_THRESHOLD = Decimal("2000")
 # or malicious) would try to create tens of thousands of QR codes and
 # database writes in one go.
 MAX_TOTAL_AMOUNT = Decimal("200000")
+
+# ponytail: links expire after this long regardless of payment status, since
+# there's no UPI webhook to know which ones were actually paid (a real PSP
+# integration like Razorpay/Cashfree would be the upgrade path for that).
+LINK_EXPIRY_SECONDS = 7 * 24 * 60 * 60  # 7 days
+
+try:
+    links_collection.create_index("payment_id", unique=True)
+    try:
+        # Auto-delete old links so an unused/ignored QR doesn't sit in Mongo
+        # forever. Doesn't distinguish paid vs. unpaid (see status note above).
+        links_collection.create_index("created_at", expireAfterSeconds=LINK_EXPIRY_SECONDS)
+    except OperationFailure as exc:
+        if exc.code != 85:  # not IndexOptionsConflict
+            raise
+        # TTL index exists with a different expiry than LINK_EXPIRY_SECONDS
+        # (someone changed the constant) — update it in place instead of
+        # dropping/recreating.
+        db.command(
+            "collMod",
+            links_collection.name,
+            index={"keyPattern": {"created_at": 1}, "expireAfterSeconds": LINK_EXPIRY_SECONDS},
+        )
+except PyMongoError as exc:
+    print(f"Warning: could not ensure indexes (Mongo unreachable?): {exc}")
 
 
 class AmountError(ValueError):
@@ -129,6 +151,7 @@ def _create_single_qr(amount: Decimal, group_id: str, part: int, total_parts: in
         "status": "pending",
         "upi_url": upi_url,
         "status_url": status_url,
+        "created_at": datetime.now(timezone.utc),
     }
     links_collection.insert_one(payment_document)
     print(f"Payment saved to database with ID: {payment_id} (part {part}/{total_parts}, amount {amount})")
@@ -142,7 +165,7 @@ def _create_single_qr(amount: Decimal, group_id: str, part: int, total_parts: in
     }
 
 
-def generate_payment_qr(amount: float):
+def generate_payment_qr(amount: Decimal):
     """Generate one or more payment QR codes for `amount`.
 
     Amounts over SPLIT_THRESHOLD are split into multiple QR codes, each
